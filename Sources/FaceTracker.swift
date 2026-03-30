@@ -1,14 +1,24 @@
 import CoreVideo
 import Vision
 
+struct FaceSample {
+    let yaw: Double?
+    let pitch: Double?
+    let frameCount: Int
+}
+
 final class FaceTracker {
     private let camera = CameraCapture()
-    private let lock = NSLock()
-    private var _latestYaw: Double?
-    private var _smoothedYaw: Double?
-    private var _latestPitch: Double?
-    private var _smoothedPitch: Double?
-    private var _frameCount: Int = 0
+    private let condition = NSCondition()
+    private var latestSampleState = FaceSample(yaw: nil, pitch: nil, frameCount: 0)
+    private var smoothedYaw: Double?
+    private var smoothedPitch: Double?
+    private let sequenceHandler = VNSequenceRequestHandler()
+    private let faceRequest: VNDetectFaceRectanglesRequest = {
+        let request = VNDetectFaceRectanglesRequest()
+        request.revision = VNDetectFaceRectanglesRequestRevision3
+        return request
+    }()
 
     /// EMA smoothing factor (0–1). Lower = smoother / more lag, higher = more responsive / more noise.
     private let smoothing: Double = 0.3
@@ -36,33 +46,27 @@ final class FaceTracker {
     // MARK: - Public accessors
 
     var latestYaw: Double? {
-        lock.lock()
-        defer { lock.unlock() }
-        return _smoothedYaw
+        snapshot().yaw
     }
 
     var latestPitch: Double? {
-        lock.lock()
-        defer { lock.unlock() }
-        return _smoothedPitch
+        snapshot().pitch
     }
 
     var frameCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return _frameCount
+        snapshot().frameCount
     }
 
     var latestEAR: Double? {
-        lock.lock()
-        defer { lock.unlock() }
+        condition.lock()
+        defer { condition.unlock() }
         return _latestEAR
     }
 
     /// Returns true (once) if a double-blink was detected since the last call.
     func consumeDoubleBlink() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
+        condition.lock()
+        defer { condition.unlock() }
         if _doubleBlinkPending {
             _doubleBlinkPending = false
             return true
@@ -81,69 +85,106 @@ final class FaceTracker {
         camera.stop()
     }
 
+    func snapshot() -> FaceSample {
+        condition.lock()
+        defer { condition.unlock() }
+        return latestSampleState
+    }
+
+    func waitForNextSample(after frameCount: Int, timeout: TimeInterval) -> FaceSample? {
+        let deadline = Date().addingTimeInterval(timeout)
+
+        condition.lock()
+        defer { condition.unlock() }
+
+        while latestSampleState.frameCount <= frameCount {
+            if !condition.wait(until: deadline), latestSampleState.frameCount <= frameCount {
+                return nil
+            }
+        }
+
+        return latestSampleState
+    }
+
     private func processFrame(_ pixelBuffer: CVPixelBuffer) {
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
-        let request = VNDetectFaceRectanglesRequest()
-        request.revision = VNDetectFaceRectanglesRequestRevision3
-
-        do {
-            try handler.perform([request])
-        } catch {
-            return
-        }
-
-        guard let face = request.results?.first,
-              let yawNumber = face.yaw else {
-            lock.lock()
-            _latestYaw = nil
-            _latestPitch = nil
-            _frameCount += 1
-            lock.unlock()
-            return
-        }
-
-        let yawDegrees = yawNumber.doubleValue * 180.0 / .pi
-        let pitchDegrees = face.pitch.map { $0.doubleValue * 180.0 / .pi }
-
-        // Detect eye landmarks for blink detection
-        var ear: Double? = nil
-        let landmarksRequest = VNDetectFaceLandmarksRequest()
-        landmarksRequest.inputFaceObservations = [face]
-        do {
-            try handler.perform([landmarksRequest])
-            if let landmarks = landmarksRequest.results?.first?.landmarks,
-               let leftEye = landmarks.leftEye,
-               let rightEye = landmarks.rightEye {
-                let leftEAR = eyeAspectRatio(region: leftEye)
-                let rightEAR = eyeAspectRatio(region: rightEye)
-                ear = (leftEAR + rightEAR) / 2.0
+        autoreleasepool {
+            do {
+                try sequenceHandler.perform([faceRequest], on: pixelBuffer)
+            } catch {
+                return
             }
-        } catch {
-            // Landmark detection failed — skip blink detection this frame
-        }
 
-        lock.lock()
-        _latestYaw = yawDegrees
-        if let prev = _smoothedYaw {
-            _smoothedYaw = prev + smoothing * (yawDegrees - prev)
+            guard let face = faceRequest.results?.first,
+                  let yawNumber = face.yaw else {
+                publishCurrentState()
+                return
+            }
+
+            let yawDegrees = yawNumber.doubleValue * 180.0 / .pi
+            let pitchDegrees = face.pitch.map { $0.doubleValue * 180.0 / .pi }
+
+            // Detect eye landmarks for blink detection
+            let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+            var ear: Double? = nil
+            let landmarksRequest = VNDetectFaceLandmarksRequest()
+            landmarksRequest.inputFaceObservations = [face]
+            do {
+                try handler.perform([landmarksRequest])
+                if let landmarks = landmarksRequest.results?.first?.landmarks,
+                   let leftEye = landmarks.leftEye,
+                   let rightEye = landmarks.rightEye {
+                    let leftEAR = eyeAspectRatio(region: leftEye)
+                    let rightEAR = eyeAspectRatio(region: rightEye)
+                    ear = (leftEAR + rightEAR) / 2.0
+                }
+            } catch {
+                // Landmark detection failed — skip blink detection this frame
+            }
+
+            updateSample(yaw: yawDegrees, pitch: pitchDegrees, ear: ear)
+        }
+    }
+
+    private func publishCurrentState() {
+        condition.lock()
+        latestSampleState = FaceSample(
+            yaw: smoothedYaw,
+            pitch: smoothedPitch,
+            frameCount: latestSampleState.frameCount + 1
+        )
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    private func updateSample(yaw: Double, pitch: Double?, ear: Double?) {
+        condition.lock()
+
+        if let previousYaw = smoothedYaw {
+            smoothedYaw = previousYaw + smoothing * (yaw - previousYaw)
         } else {
-            _smoothedYaw = yawDegrees
+            smoothedYaw = yaw
         }
-        if let pitch = pitchDegrees {
-            if let prev = _smoothedPitch {
-                _smoothedPitch = prev + smoothing * (pitch - prev)
+
+        if let pitch {
+            if let previousPitch = smoothedPitch {
+                smoothedPitch = previousPitch + smoothing * (pitch - previousPitch)
             } else {
-                _smoothedPitch = pitch
+                smoothedPitch = pitch
             }
-            _latestPitch = pitch
         }
-        _frameCount += 1
 
         if let earValue = ear {
             _latestEAR = earValue
             detectBlink(ear: earValue)
         }
-        lock.unlock()
+
+        latestSampleState = FaceSample(
+            yaw: smoothedYaw,
+            pitch: smoothedPitch,
+            frameCount: latestSampleState.frameCount + 1
+        )
+        condition.broadcast()
+        condition.unlock()
     }
 
     // MARK: - Blink detection (called under lock)
